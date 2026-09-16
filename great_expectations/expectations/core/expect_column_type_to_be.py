@@ -21,6 +21,9 @@ from great_expectations.expectations.model_field_descriptions import (
     FAILURE_SEVERITY_DESCRIPTION,
 )
 from great_expectations.expectations.type_comparison import (
+    CASE_INSENSITIVE_DIALECTS,
+    _get_dialect_type_module,
+    _get_potential_sqlalchemy_types,
     compare_column_type,
     native_type_type_map,
 )
@@ -80,11 +83,14 @@ class ExpectColumnTypeToBe(BatchExpectation):
         column (str): {COLUMN_DESCRIPTION}
         type\\_ (str): {TYPE_DESCRIPTION}
             For example, valid types for Pandas Datasources include any numpy dtype values \
-            (such as 'int64') or native python types (such as 'int'), whereas valid types \
-            for a SqlAlchemy Datasource include types named by the current driver such as 'INTEGER' \
+            (such as 'int64'), pandas dtype names, or native python type names (such as 'int'). \
+            This is a schema-level check: an object-dtype column matches only an object type \
+            request ('object', 'object_', or 'O'); 'str' does not match object dtype. \
+            For a SqlAlchemy Datasource valid types include types named by the current driver such as 'INTEGER' \
             in most SQL dialects and 'TEXT' in dialects such as postgresql. \
             Valid types for Spark Datasources include 'StringType', 'BooleanType' and other \
-            pyspark-defined type names.
+            pyspark-defined type names. An unrecognized type_ for the backend raises an error \
+            rather than returning a plain success=False.
 
     Other Parameters:
         result_format (str or None, optional): \
@@ -279,32 +285,32 @@ class ExpectColumnTypeToBe(BatchExpectation):
             )
         ]
 
+    @staticmethod
+    def _build_pandas_comp_types(expected_type) -> list:
+        comp_types = []
+        try:
+            comp_types.append(np.dtype(expected_type).type)
+        except TypeError:
+            for module in (pd, pd.core.dtypes.dtypes):
+                try:
+                    pd_type = getattr(module, expected_type)
+                except AttributeError:
+                    continue
+                if isinstance(pd_type, type):
+                    comp_types.append(pd_type)
+
+        native_type = native_type_type_map(expected_type)
+        if native_type is not None:
+            comp_types.extend(native_type)
+        return comp_types
+
     def _validate_pandas(self, actual_column_type, expected_type):
         if expected_type is None:
             success = True
         else:
-            comp_types = []
-
-            try:
-                comp_types.append(np.dtype(expected_type).type)
-            except TypeError:
-                try:
-                    pd_type = getattr(pd, expected_type)
-                    if isinstance(pd_type, type):
-                        comp_types.append(pd_type)
-                except AttributeError:
-                    pass
-
-                try:
-                    pd_type = getattr(pd.core.dtypes.dtypes, expected_type)
-                    if isinstance(pd_type, type):
-                        comp_types.append(pd_type)
-                except AttributeError:
-                    pass
-
-            native_type = native_type_type_map(expected_type)
-            if native_type is not None:
-                comp_types.extend(native_type)
+            comp_types = self._build_pandas_comp_types(expected_type)
+            if len(comp_types) == 0:
+                raise ValueError(f"Unrecognized pandas type: {expected_type}")  # noqa: TRY003
 
             success = actual_column_type.type in comp_types
 
@@ -320,7 +326,30 @@ class ExpectColumnTypeToBe(BatchExpectation):
         success, observed_value = compare_column_type(
             execution_engine, actual_column_type, expected_type
         )
+        if not success and not self._is_known_sqlalchemy_type(execution_engine, expected_type):
+            raise ValueError(f"Unrecognized sqlalchemy type: {expected_type}")  # noqa: TRY003
         return {"success": success, "result": {"observed_value": observed_value}}
+
+    @staticmethod
+    def _is_known_sqlalchemy_type(execution_engine, expected_type) -> bool:
+        from great_expectations.compatibility.sqlalchemy import sqlalchemy as sa
+
+        if execution_engine.dialect_name in CASE_INSENSITIVE_DIALECTS:
+            try:
+                type_module = _get_dialect_type_module(execution_engine=execution_engine)
+            except Exception:
+                return True
+            base_name = expected_type.split("(")[0].strip().casefold()
+            try:
+                module_names = {name.casefold() for name in dir(type_module)}
+                module_names.update(name.casefold() for name in dir(sa.types))
+                return base_name in module_names
+            except Exception:
+                return True
+        types = _get_potential_sqlalchemy_types(
+            execution_engine=execution_engine, expected_type=expected_type
+        )
+        return len(types) > 0
 
     def _validate_spark(self, actual_column_type, expected_type):
         if expected_type is None:

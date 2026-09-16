@@ -38,6 +38,37 @@ def test_validate_pandas_failure_reports_observed_value():
 
 
 @pytest.mark.unit
+def test_validate_pandas_native_int_success():
+    expectation = ExpectColumnTypeToBe(column="a", type_="int")
+    result = expectation._validate_pandas(actual_column_type=np.dtype("int64"), expected_type="int")
+    assert result["success"] is True
+    assert result["result"] == {"observed_value": "int64"}
+
+
+@pytest.mark.unit
+def test_validate_pandas_object_matches_only_object():
+    expectation = ExpectColumnTypeToBe(column="a", type_="object")
+    result = expectation._validate_pandas(
+        actual_column_type=np.dtype("object"), expected_type="object"
+    )
+    assert result["success"] is True
+
+    str_expectation = ExpectColumnTypeToBe(column="a", type_="str")
+    str_result = str_expectation._validate_pandas(
+        actual_column_type=np.dtype("object"), expected_type="str"
+    )
+    assert str_result["success"] is False
+    assert str_result["result"] == {"observed_value": "object_"}
+
+
+@pytest.mark.unit
+def test_validate_pandas_unknown_type_raises():
+    expectation = ExpectColumnTypeToBe(column="a", type_="NUMBER")
+    with pytest.raises(ValueError, match="Unrecognized pandas type"):
+        expectation._validate_pandas(actual_column_type=np.dtype("int64"), expected_type="NUMBER")
+
+
+@pytest.mark.unit
 def test_validate_missing_column_fails_with_null_observed_value():
     expectation = ExpectColumnTypeToBe(column="missing", type_="INTEGER")
     result = expectation._validate(metrics={"table.column_types": []})
@@ -88,3 +119,16 @@ def test_sqlite_end_to_end_success_and_failure(sa):
 
     failure_result = validator.expect_column_type_to_be("col", type_="INTEGER")
     assert failure_result.success is False
+
+
+@pytest.mark.sqlite
+def test_sqlite_unknown_type_reports_exception(sa):
+    df = pd.DataFrame({"col": ["test_val1", "test_val2"]})
+    validator = build_sa_validator_with_data(
+        df=df,
+        sa_engine_name="sqlite",
+        table_name="expect_column_type_to_be_sqlite_unknown",
+    )
+
+    with pytest.raises(ValueError, match="Unrecognized sqlalchemy type"):
+        validator.expect_column_type_to_be("col", type_="NUMBER")
