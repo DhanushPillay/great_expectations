@@ -1134,7 +1134,15 @@ MARKER_DEPENDENCY_MAP: Final[Mapping[str, TestDependencies]] = {
 }
 
 
-def _marker_statement(marker: str) -> str:
+# Markers that select a suite meant to run in a lane of its own rather than inside the
+# shared per-data-source lanes. A shared lane's marker expression excludes every one of
+# these by default; a lane can opt into exactly one via `_marker_statement`'s `suite`
+# argument. Adding a future suite marker is one tuple entry here, not an edit to every
+# lane's expression.
+_SUITE_MARKERS: Final[tuple[str, ...]] = ("gallery",)
+
+
+def _marker_statement(marker: str, suite: str = "") -> str:
     # Perhaps we should move this configuration to the MARKER_DEPENDENCY_MAP instead of
     # doing the mapping here.
     if marker == "mssql":
@@ -1146,9 +1154,18 @@ def _marker_statement(marker: str) -> str:
         "spark",
         "trino",
     ]:
-        return f"'all_backends or {marker}'"
+        base = f"all_backends or {marker}"
     else:
-        return f"'{marker}'"
+        base = marker
+
+    # The base expression is parenthesised before anything is conjoined to it: some
+    # lanes' markers are themselves disjunctions, and `and` binds tighter than `or`, so
+    # conjoining without parentheses would silently re-scope the clause below to only the
+    # last disjunct instead of the whole expression.
+    if suite:
+        return f"'({base}) and {suite}'"
+    exclusion = " and ".join(f"not {suite_marker}" for suite_marker in _SUITE_MARKERS)
+    return f"'({base}) and {exclusion}'"
 
 
 def _tokenize_marker_string(marker_string: str) -> Generator[str, None, None]:
@@ -1296,10 +1313,18 @@ def docs_snippet_tests(
         "splits": "Total number of pytest-split shards. Must be paired with --group.",
         "group": "1-based pytest-split shard index to run. Must satisfy 1 <= group <= splits.",
         "W": "Warnings control",
+        "suite": (
+            "Opt into a suite meant to run in a lane of its own (e.g. 'gallery') instead of "
+            "excluding it, for the given marker."
+        ),
+        "gallery_measurement": (
+            "Forward --gallery-measurement to pytest, substituting every configured, "
+            "engine-recognized data source for the gallery tier's declared membership."
+        ),
     },
     iterable=["service_names", "up_services", "verbose"],
 )
-def ci_tests(  # noqa: C901 - too complex (9)
+def ci_tests(  # noqa: C901, PLR0912 - too complex (14), too many branches (13)
     ctx: Context,
     marker: str,
     up_services: bool = False,
@@ -1318,6 +1343,8 @@ def ci_tests(  # noqa: C901 - too complex (9)
     group: int = 0,
     W: str | None = None,
     pty: bool = True,
+    suite: str = "",
+    gallery_measurement: bool = False,
 ):
     """
     Run tests in CI.
@@ -1369,6 +1396,9 @@ def ci_tests(  # noqa: C901 - too complex (9)
         # https://docs.python.org/3/library/warnings.html#describing-warning-filters
         pytest_options.append(f"-W={W}")
 
+    if gallery_measurement:
+        pytest_options.append("--gallery-measurement")
+
     for test_deps in _get_marker_dependencies(marker):
         if restart_services or up_services:
             service(
@@ -1382,7 +1412,7 @@ def ci_tests(  # noqa: C901 - too complex (9)
         for extra_pytest_arg in test_deps.extra_pytest_args:
             pytest_options.append(extra_pytest_arg)
 
-    pytest_cmd = ["pytest", "-m", _marker_statement(marker)] + pytest_options
+    pytest_cmd = ["pytest", "-m", _marker_statement(marker, suite=suite)] + pytest_options
     ctx.run(" ".join(pytest_cmd), echo=True, pty=pty)
 
 
