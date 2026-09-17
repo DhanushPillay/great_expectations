@@ -62,6 +62,29 @@ def test_validate_pandas_object_matches_only_object():
 
 
 @pytest.mark.unit
+def test_validate_pandas_extension_types_match_and_mismatch():
+    expectation = ExpectColumnTypeToBe(column="a", type_="Int64")
+    result = expectation._validate_pandas(actual_column_type=pd.Int64Dtype(), expected_type="Int64")
+    assert result["success"] is True
+
+    string_expectation = ExpectColumnTypeToBe(column="a", type_="string")
+    string_result = string_expectation._validate_pandas(
+        actual_column_type=pd.StringDtype(), expected_type="string"
+    )
+    assert string_result["success"] is True
+
+
+@pytest.mark.unit
+def test_validate_pandas_known_but_nonmatching_returns_false():
+    for known_type in ("float64", "Float64", "string", "boolean"):
+        expectation = ExpectColumnTypeToBe(column="a", type_=known_type)
+        result = expectation._validate_pandas(
+            actual_column_type=np.dtype("int64"), expected_type=known_type
+        )
+        assert result["success"] is False
+
+
+@pytest.mark.unit
 def test_validate_pandas_unknown_type_raises():
     expectation = ExpectColumnTypeToBe(column="a", type_="NUMBER")
     with pytest.raises(ValueError, match="Unrecognized pandas type"):
@@ -119,6 +142,7 @@ def test_sqlite_end_to_end_success_and_failure(sa):
 
     failure_result = validator.expect_column_type_to_be("col", type_="INTEGER")
     assert failure_result.success is False
+    assert failure_result.exception_info["raised_exception"] is False
 
 
 @pytest.mark.sqlite

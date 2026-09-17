@@ -25,11 +25,13 @@ from tests.integration.test_utils.data_source_config import (
 
 INTEGER_COLUMN = "integers"
 STRING_COLUMN = "strings"
+FLOAT_COLUMN = "floats"
 
 DATA = pd.DataFrame(
     {
         INTEGER_COLUMN: [1, 2, 3, 4, 5],
         STRING_COLUMN: ["a", "b", "c", "d", "e"],
+        FLOAT_COLUMN: [1.5, 2.5, 3.5, 4.5, 5.5],
     },
     dtype="object",
 )
@@ -48,6 +50,7 @@ try:
     SPARK_COLUMN_TYPES = {
         INTEGER_COLUMN: PYSPARK_TYPES.IntegerType,
         STRING_COLUMN: PYSPARK_TYPES.StringType,
+        FLOAT_COLUMN: PYSPARK_TYPES.DoubleType,
     }
 except ModuleNotFoundError:
     SPARK_COLUMN_TYPES = {}
@@ -195,6 +198,38 @@ def test_case_insensitive_dialects(batch_for_datasource: Batch) -> None:
         assert result.success, f"Expected success for type '{type_str}' on dialect '{dialect_name}'"
 
 
+@parameterize_batch_for_data_sources(
+    data_source_configs=[PostgreSQLDatasourceTestConfig()],
+    data=DATA,
+)
+def test_double_precision_matches_float_not_int(batch_for_datasource: Batch) -> None:
+    """Multi-word DDL type is known vocabulary: match on float, plain mismatch on int."""
+    float_result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=FLOAT_COLUMN, type_="DOUBLE PRECISION")
+    )
+    assert float_result.success
+
+    int_result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="DOUBLE PRECISION")
+    )
+    assert not int_result.success
+    assert int_result.exception_info["raised_exception"] is False
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        SqliteDatasourceTestConfig(),
+    ],
+    data=DATA,
+)
+def test_known_type_mismatch_sqlite(batch_for_datasource: Batch) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=STRING_COLUMN, type_="INTEGER")
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is False
+
+
 @pytest.mark.parametrize(
     "suite_param_value,expected_result",
     [
@@ -225,6 +260,19 @@ def test_failure(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="NUMBER")
     result = batch_for_datasource.validate(expectation)
     assert not result.success
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=JUST_PANDAS_DATA_SOURCES,
+    data=TYPED_DATA,
+)
+def test_known_type_mismatch_returns_false(batch_for_datasource: Batch) -> None:
+    """Known pandas type on a non-matching column is a plain failure, not an error."""
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="float64")
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is False
 
 
 @parameterize_batch_for_data_sources(
