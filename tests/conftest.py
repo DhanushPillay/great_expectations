@@ -1880,7 +1880,10 @@ def arbitrary_validation_definition(
 @pytest.fixture
 def validator_with_mock_execution_engine(mocker: MockerFixture) -> Validator:
     execution_engine = mocker.MagicMock()
-    validator = Validator(execution_engine=execution_engine)
+    # A Validator without a Batch refuses attribute access (see Validator.__getattr__), so
+    # give it one; the engine is a mock, so nothing is loaded anywhere.
+    batch = mocker.MagicMock(id="mock_batch_id")
+    validator = Validator(execution_engine=execution_engine, batches=[batch])
     return validator
 
 
