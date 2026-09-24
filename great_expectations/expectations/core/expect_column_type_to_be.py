@@ -287,6 +287,7 @@ class ExpectColumnTypeToBe(BatchExpectation):
     @staticmethod
     def _build_pandas_comp_types(expected_type) -> list:
         from pandas.api.types import pandas_dtype
+        from pandas.core.dtypes import dtypes as pandas_dtypes_module
 
         try:
             parsed = pandas_dtype(expected_type)
@@ -299,7 +300,7 @@ class ExpectColumnTypeToBe(BatchExpectation):
         try:
             comp_types.append(np.dtype(expected_type).type)
         except TypeError:
-            for module in (pd, pd.core.dtypes.dtypes):
+            for module in (pd, pandas_dtypes_module):
                 try:
                     pd_type = getattr(module, expected_type)
                 except AttributeError:
