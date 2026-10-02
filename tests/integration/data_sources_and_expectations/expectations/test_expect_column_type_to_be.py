@@ -1,5 +1,8 @@
+import datetime
+
 import pandas as pd
 import pytest
+from sqlalchemy import types as sqlatypes
 
 import great_expectations.expectations as gxe
 from great_expectations.core.result_format import ResultFormat
@@ -56,6 +59,22 @@ NULLABLE_DATA = pd.DataFrame(
 DATETIME_DATA = pd.DataFrame(
     {DATETIME_COLUMN: pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"])}
 )
+
+BIGINT_COLUMN = "bigints"
+DATE_COLUMN = "dates"
+SQL_DATETIME_COLUMN = "sql_datetimes"
+
+SQL_TYPED_DATA = pd.DataFrame(
+    {
+        BIGINT_COLUMN: [1, 2, 3],
+        DATE_COLUMN: [datetime.date(2024, 1, d) for d in (1, 2, 3)],
+        SQL_DATETIME_COLUMN: pd.to_datetime(
+            ["2024-01-01 12:00", "2024-01-02 12:00", "2024-01-03 12:00"]
+        ),
+    }
+)
+
+PANDAS_3 = int(pd.__version__.split(".")[0]) >= 3
 
 
 try:
@@ -144,6 +163,19 @@ def test_unitless_datetime64_matches_any_resolution(batch_for_datasource: Batch)
     assert result.result["observed_value"].startswith("datetime64[")
 
 
+@pytest.mark.skipif(not PANDAS_3, reason="string columns default to object dtype before pandas 3")
+@parameterize_batch_for_data_sources(
+    data_source_configs=JUST_PANDAS_DATA_SOURCES,
+    data=TYPED_DATA,
+)
+def test_str_matches_default_string_column(batch_for_datasource: Batch) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=STRING_COLUMN, type_="str")
+    )
+    assert result.success
+    assert result.result["observed_value"] == "str"
+
+
 @parameterize_batch_for_data_sources(
     data_source_configs=JUST_PANDAS_DATA_SOURCES,
     data=DATA,
@@ -190,7 +222,7 @@ def test_success_sql_integer(batch_for_datasource: Batch) -> None:
     data_source_configs=[DatabricksDatasourceTestConfig()],
     data=DATA,
 )
-def test_success_for_type__Integer(batch_for_datasource: Batch) -> None:
+def test_success_for_type__INT(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="INT")
     result = batch_for_datasource.validate(expectation)
     assert result.success
@@ -208,13 +240,66 @@ def test_success_for_type__IntegerType(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="IntegerType")
     result = batch_for_datasource.validate(expectation)
     assert result.success
+    assert result.result == {"observed_value": "IntegerType"}
+
+
+@pytest.mark.parametrize(
+    "type_,expected_success",
+    [
+        pytest.param("LongType", False, id="mismatch"),
+        pytest.param("StringType", False, id="other-family-mismatch"),
+        pytest.param("NumericType", True, id="abstract-family-match"),
+        pytest.param("IntegralType", True, id="abstract-subfamily-match"),
+    ],
+)
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        SparkFilesystemCsvDatasourceTestConfig(
+            column_types=SPARK_COLUMN_TYPES,
+        )
+    ],
+    data=DATA,
+)
+def test_spark_known_type(batch_for_datasource: Batch, type_: str, expected_success: bool) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_=type_)
+    )
+    assert result.success is expected_success
+    assert result.result == {"observed_value": "IntegerType"}
+    assert result.exception_info["raised_exception"] is False
+
+
+@pytest.mark.parametrize(
+    "type_",
+    [
+        pytest.param("NotAType", id="unknown-name"),
+        pytest.param("int", id="spark-sql-name"),
+        pytest.param("Row", id="non-type-class"),
+        pytest.param("Any", id="typing-alias"),
+    ],
+)
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        SparkFilesystemCsvDatasourceTestConfig(
+            column_types=SPARK_COLUMN_TYPES,
+        )
+    ],
+    data=DATA,
+)
+def test_spark_unrecognized_type_raises(batch_for_datasource: Batch, type_: str) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_=type_)
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is True
+    assert f"Unrecognized spark type: {type_}" in result.exception_info["exception_message"]
 
 
 @parameterize_batch_for_data_sources(
     data_source_configs=[SnowflakeDatasourceTestConfig()],
     data=DATA,
 )
-def test_success_for_type__Number(batch_for_datasource: Batch) -> None:
+def test_success_for_type__DECIMAL_38_0(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="DECIMAL(38, 0)")
     result = batch_for_datasource.validate(expectation)
     assert result.success
@@ -268,6 +353,79 @@ def test_double_precision_matches_float_not_int(batch_for_datasource: Batch) -> 
     assert int_result.exception_info["raised_exception"] is False
 
 
+@pytest.mark.parametrize(
+    "column,type_",
+    [
+        pytest.param(BIGINT_COLUMN, "BIGINT", id="bigint"),
+        pytest.param(DATE_COLUMN, "DATE", id="date"),
+        pytest.param(SQL_DATETIME_COLUMN, "datetime", id="datetime-any-case"),
+    ],
+)
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        SqliteDatasourceTestConfig(
+            column_types={
+                BIGINT_COLUMN: sqlatypes.BIGINT,
+                DATE_COLUMN: sqlatypes.DATE,
+                SQL_DATETIME_COLUMN: sqlatypes.DATETIME,
+            }
+        ),
+    ],
+    data=SQL_TYPED_DATA,
+)
+def test_observed_type_name_matches_sqlite(
+    batch_for_datasource: Batch, column: str, type_: str
+) -> None:
+    """The type name reported as observed_value always matches, even where the dialect module
+    does not export it (BIGINT) or resolves it to a different class than the reflected type."""
+    result = batch_for_datasource.validate(gxe.ExpectColumnTypeToBe(column=column, type_=type_))
+    assert result.success
+    assert result.result["observed_value"] == type_.upper()
+
+
+@pytest.mark.parametrize(
+    "type_",
+    [
+        pytest.param("int4", id="dialect-alias"),
+        pytest.param("bool", id="dialect-alias-other-type"),
+        pytest.param("NUMBER", id="other-dialect-name"),
+        pytest.param("NOT_A_TYPE", id="unknown-name"),
+    ],
+)
+@parameterize_batch_for_data_sources(
+    data_source_configs=[PostgreSQLDatasourceTestConfig()],
+    data=DATA,
+)
+def test_unresolved_type_name_is_a_plain_failure_postgresql(
+    batch_for_datasource: Batch, type_: str
+) -> None:
+    """Aliases are not resolved and unknown names do not raise: the observed value names the
+    type to use instead."""
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_=type_)
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is False
+    assert result.result == {"observed_value": "INTEGER"}
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        MySQLDatasourceTestConfig(),
+        SqliteDatasourceTestConfig(),
+    ],
+    data=DATA,
+)
+def test_unknown_type_name_is_a_plain_failure(batch_for_datasource: Batch) -> None:
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="NOT_A_TYPE")
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is False
+    assert set(result.result) == {"observed_value"}
+    assert result.result["observed_value"] is not None
+
+
 @parameterize_batch_for_data_sources(
     data_source_configs=[
         SqliteDatasourceTestConfig(),
@@ -286,6 +444,7 @@ def test_known_type_mismatch_sqlite(batch_for_datasource: Batch) -> None:
     "suite_param_value,expected_result",
     [
         pytest.param("int64", True, id="success"),
+        pytest.param("float64", False, id="failure"),
     ],
 )
 @parameterize_batch_for_data_sources(data_source_configs=JUST_PANDAS_DATA_SOURCES, data=TYPED_DATA)
@@ -302,16 +461,6 @@ def test_success_with_suite_param_type_(
         expectation, expectation_parameters={suite_param_key: suite_param_value}
     )
     assert result.success == expected_result
-
-
-@parameterize_batch_for_data_sources(
-    data_source_configs=JUST_PANDAS_DATA_SOURCES,
-    data=DATA,
-)
-def test_failure(batch_for_datasource: Batch) -> None:
-    expectation = gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="NUMBER")
-    result = batch_for_datasource.validate(expectation)
-    assert not result.success
 
 
 @parameterize_batch_for_data_sources(
@@ -340,10 +489,20 @@ def test_unknown_type_raises_exception_info(batch_for_datasource: Batch) -> None
 
 
 @parameterize_batch_for_data_sources(
-    data_source_configs=JUST_PANDAS_DATA_SOURCES,
+    data_source_configs=[
+        PandasDataFrameDatasourceTestConfig(),
+        SqliteDatasourceTestConfig(),
+        PostgreSQLDatasourceTestConfig(),
+        SparkFilesystemCsvDatasourceTestConfig(column_types=SPARK_COLUMN_TYPES),
+    ],
     data=DATA,
 )
-def test_missing_column_failure(batch_for_datasource: Batch) -> None:
+def test_missing_column_raises(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column="non_existent_column", type_="INTEGER")
     result = batch_for_datasource.validate(expectation)
     assert not result.success
+    assert result.exception_info["raised_exception"] is True
+    assert (
+        'The column "non_existent_column" in BatchData does not exist'
+        in result.exception_info["exception_message"]
+    )

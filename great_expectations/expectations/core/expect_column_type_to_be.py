@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Type, Union
 
 import numpy as np
@@ -11,6 +10,7 @@ from great_expectations.compatibility.typing_extensions import override
 from great_expectations.core.suite_parameters import (
     SuiteParameterDict,  # noqa: TC001
 )
+from great_expectations.exceptions import InvalidMetricAccessorDomainKwargsKeyError
 from great_expectations.expectations.expectation import (
     BatchExpectation,
     render_suite_parameter_string,
@@ -20,10 +20,7 @@ from great_expectations.expectations.model_field_descriptions import (
     COLUMN_DESCRIPTION,
     FAILURE_SEVERITY_DESCRIPTION,
 )
-from great_expectations.expectations.type_comparison import (
-    _get_dialect_type_module,
-    compare_column_type,
-)
+from great_expectations.expectations.type_comparison import compare_column_type
 from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
 from great_expectations.render.renderer.renderer import renderer
 from great_expectations.render.renderer_configuration import (
@@ -41,8 +38,6 @@ if TYPE_CHECKING:
         ExpectationConfiguration,
     )
     from great_expectations.render.renderer_configuration import AddParamArgs
-
-logger = logging.getLogger(__name__)
 
 EXPECTATION_SHORT_DESCRIPTION = "Expect a column to be of a specified data type."
 TYPE_DESCRIPTION = """
@@ -84,16 +79,25 @@ class ExpectColumnTypeToBe(BatchExpectation):
             nullable/extension dtype names ('Int64', 'boolean', 'string', 'category'), or \
             aliases pandas resolves to a dtype ('int', 'float'). \
             This is a schema-level check against the column's exact dtype: 'int64' and 'Int64' \
-            are different types, as are 'str' and 'string'; a datetime unit or time zone, when \
-            given, must match; and an object-dtype column matches only an object type request \
-            ('object', 'object_', or 'O'). A name without parameters matches any dtype of that \
-            family: 'category' matches any categorical column, 'interval' any interval column, \
-            and 'datetime64' or 'timedelta64' any time-zone-naive column of that kind. \
-            For a SqlAlchemy Datasource valid types include types named by the current driver such as 'INTEGER' \
-            in most SQL dialects and 'TEXT' in dialects such as postgresql. \
-            Valid types for Spark Datasources include 'StringType', 'BooleanType' and other \
-            pyspark-defined type names. An unrecognized type_ raises an error where the backend \
-            exposes its type vocabulary, and otherwise returns success=False.
+            are different types, as are 'int64' and 'int32', and 'str' and 'string'; a datetime \
+            unit or time zone, when given, must match; and an object-dtype column matches only \
+            an object type request ('object' or 'O'). The storage of a string dtype is not \
+            checked: 'string[python]' and 'string[pyarrow]' match the same columns. \
+            'category' matches any categorical column, 'interval' any interval column, and \
+            'datetime64' or 'timedelta64' any time-zone-naive numpy column of that kind; other \
+            names match only the exact dtype they name. \
+            For a SqlAlchemy Datasource, type_ matches when it is the type name reported as the \
+            observed value, compared case-insensitively, or a SQLAlchemy type the column is an \
+            instance of, such as 'INTEGER' in most SQL dialects and 'TEXT' in dialects such as \
+            postgresql. Dialect aliases are not resolved: use the observed type name, for \
+            example 'INTEGER' rather than 'int4' on postgresql. \
+            Valid types for Spark Datasources are pyspark DataType class names such as \
+            'StringType' and 'BooleanType'; an abstract class such as 'NumericType' matches every \
+            type in that family. Spark SQL type names such as 'int' are not accepted. \
+            An unrecognized type_ raises an error on Pandas and Spark Datasources. SQL dialects \
+            expose no reliable list of their types, so on a SqlAlchemy Datasource an \
+            unrecognized type_ returns success=False with the column's actual type as the \
+            observed value. A column that does not exist raises an error.
 
     Other Parameters:
         result_format (str or None, optional): \
@@ -128,11 +132,14 @@ class ExpectColumnTypeToBe(BatchExpectation):
         [{SUPPORTED_DATA_SOURCES[10]}](https://docs.greatexpectations.io/docs/application_integration_support/)
         [{SUPPORTED_DATA_SOURCES[11]}](https://docs.greatexpectations.io/docs/application_integration_support/)
         [{SUPPORTED_DATA_SOURCES[12]}](https://docs.greatexpectations.io/docs/application_integration_support/)
+        [{SUPPORTED_DATA_SOURCES[13]}](https://docs.greatexpectations.io/docs/application_integration_support/)
 
     Data Quality Issues:
         {DATA_QUALITY_ISSUES[0]}
 
     Example Data:
+            A SQL table created as (test FLOAT, test2 INTEGER):
+
                 test 	test2
             0 	1.00 	2
             1 	2.30 	5
@@ -250,7 +257,9 @@ class ExpectColumnTypeToBe(BatchExpectation):
         for name, param_type in add_param_args:
             renderer_configuration.add_param(name=name, param_type=param_type)
 
-        template_str = "$column must be of type $type_."
+        template_str = "must be of type $type_."
+        if renderer_configuration.include_column_name:
+            template_str = f"$column {template_str}"
 
         renderer_configuration.template_str = template_str
 
@@ -268,6 +277,7 @@ class ExpectColumnTypeToBe(BatchExpectation):
         **kwargs,
     ) -> list[RenderedStringTemplateContent]:
         runtime_configuration = runtime_configuration or {}
+        include_column_name = runtime_configuration.get("include_column_name") is not False
         styling = runtime_configuration.get("styling")
 
         params = substitute_none_for_missing(
@@ -275,7 +285,9 @@ class ExpectColumnTypeToBe(BatchExpectation):
             ["column", "type_"],
         )
 
-        template_str = "$column must be of type $type_."
+        template_str = "must be of type $type_."
+        if include_column_name:
+            template_str = f"$column {template_str}"
 
         return [
             RenderedStringTemplateContent(
@@ -289,40 +301,39 @@ class ExpectColumnTypeToBe(BatchExpectation):
         ]
 
     def _validate_pandas(self, actual_column_type, expected_type):
-        if expected_type is None:
-            success = True
+        from pandas.api.types import pandas_dtype
+
+        try:
+            parsed = pandas_dtype(expected_type)
+        except Exception as e:
+            # pandas_dtype is the parser for the requested name; whatever it raises (a
+            # TypeError, or an ImportError for a pyarrow dtype without pyarrow installed)
+            # means pandas cannot construct the requested type.
+            msg = f"Unrecognized pandas type: {expected_type}"
+            raise ValueError(msg) from e
+
+        if (
+            isinstance(parsed, np.dtype)
+            and parsed.kind in "mM"
+            and np.datetime_data(parsed)[0] == "generic"
+        ):
+            # A unit-less "datetime64"/"timedelta64" names the kind, not a resolution:
+            # pandas versions differ in the default unit they produce for the same data.
+            success = (
+                isinstance(actual_column_type, np.dtype) and actual_column_type.kind == parsed.kind
+            )
+        elif isinstance(actual_column_type, pd.StringDtype) and isinstance(parsed, pd.StringDtype):
+            # Every StringDtype compares equal to the name "string", but "str" (NaN for
+            # missing values) and "string" (pd.NA) are distinct column types. The storage
+            # ("python" or "pyarrow") is deliberately not compared.
+            success = str(actual_column_type) == str(parsed)
         else:
-            from pandas.api.types import pandas_dtype
-
-            try:
-                parsed = pandas_dtype(expected_type)
-            except (TypeError, ValueError):
-                raise ValueError(f"Unrecognized pandas type: {expected_type}")  # noqa: TRY003
-
-            if (
-                isinstance(parsed, np.dtype)
-                and parsed.kind in "mM"
-                and np.datetime_data(parsed)[0] == "generic"
-            ):
-                # A unit-less "datetime64"/"timedelta64" names the kind, not a resolution:
-                # pandas versions differ in the default unit they produce for the same data.
-                success = (
-                    isinstance(actual_column_type, np.dtype)
-                    and actual_column_type.kind == parsed.kind
-                )
-            elif isinstance(actual_column_type, pd.StringDtype) and isinstance(
-                parsed, pd.StringDtype
-            ):
-                # Every StringDtype compares equal to the name "string", but "str" (NaN for
-                # missing values) and "string" (pd.NA) are distinct column types.
-                success = str(actual_column_type) == str(parsed)
-            else:
-                # Compare dtypes, not their scalar `.type`: nullable and non-nullable dtypes
-                # (e.g. Int64 and int64) share a scalar type but are distinct column types.
-                # Each dtype's own comparison against the requested name decides most matches;
-                # it is also what lets a parameter-free name such as "category" or "interval"
-                # match any dtype of that family.
-                success = actual_column_type in (parsed, expected_type)
+            # Compare dtypes, not their scalar `.type`: nullable and non-nullable dtypes
+            # (e.g. Int64 and int64) share a scalar type but are distinct column types.
+            # The dtype's own comparison against the requested name lets a parameter-free
+            # name such as "category" or "interval" match any dtype of that family; the
+            # parsed dtype matches spellings pandas normalizes, such as a lower-case time zone.
+            success = actual_column_type in (parsed, expected_type)
 
         return {
             "success": success,
@@ -330,87 +341,28 @@ class ExpectColumnTypeToBe(BatchExpectation):
         }
 
     def _validate_sqlalchemy(self, actual_column_type, expected_type, execution_engine):
-        if expected_type is None:
-            observed = type(actual_column_type).__name__
-            return {"success": True, "result": {"observed_value": observed}}
         success, observed_value = compare_column_type(
             execution_engine, actual_column_type, expected_type
         )
-        if not success and self._is_known_sqlalchemy_type(execution_engine, expected_type) is False:
-            raise ValueError(f"Unrecognized sqlalchemy type: {expected_type}")  # noqa: TRY003
+        if not success:
+            # The observed value is the type name reported for the column, so naming it always
+            # matches -- including where the dialect module does not export that name, or
+            # resolves it to a dialect-specific class the reflected type is not an instance of.
+            success = str(observed_value).casefold() == expected_type.casefold()
         return {"success": success, "result": {"observed_value": observed_value}}
 
-    @staticmethod
-    def _normalize_sql_type_name(name: str) -> str:
-        return name.split("(", maxsplit=1)[0].strip().casefold().replace("_", " ")
-
-    @classmethod
-    def _type_attr_names(cls, module) -> set[str]:
-        from great_expectations.compatibility.sqlalchemy import sqlalchemy as sa
-
-        type_engine = getattr(sa.types, "TypeEngine", None)
-        names: set[str] = set()
-        for attr_name in dir(module):
-            if attr_name.startswith("_"):
-                continue
-            try:
-                attr_value = getattr(module, attr_name)
-            except Exception:
-                continue
-            if not isinstance(attr_value, type):
-                continue
-            try:
-                is_type = type_engine is None or issubclass(attr_value, type_engine)
-            except TypeError:
-                continue
-            if is_type:
-                names.add(cls._normalize_sql_type_name(attr_name))
-        return names
-
-    @classmethod
-    def _is_known_sqlalchemy_type(cls, execution_engine, expected_type) -> bool | None:
-        """Whether expected_type belongs to the backend's type vocabulary.
-
-        Returns True (known), False (reliably absent — caller raises), or None
-        (no reliable vocabulary source — caller keeps the plain success=False).
-        """
-        vocabulary: set[str] = set()
-        dialect = getattr(execution_engine, "dialect", None)
-        ischema_names = getattr(dialect, "ischema_names", None)
-        if isinstance(ischema_names, dict):
-            vocabulary.update(
-                cls._normalize_sql_type_name(key) for key in ischema_names if isinstance(key, str)
-            )
-        from great_expectations.compatibility.sqlalchemy import sqlalchemy as sa
-
-        vocabulary.update(cls._type_attr_names(sa.types))
-        vocabulary.update(cls._type_attr_names(sa.sql.sqltypes))
-        try:
-            type_module = _get_dialect_type_module(execution_engine=execution_engine)
-        except Exception:
-            type_module = None
-        if type_module is not None:
-            vocabulary.update(cls._type_attr_names(type_module))
-        if not vocabulary:
-            return None
-        return cls._normalize_sql_type_name(expected_type) in vocabulary
-
     def _validate_spark(self, actual_column_type, expected_type):
-        if expected_type is None:
-            success = True
-        else:
-            types = []
-            try:
-                type_class = getattr(pyspark.types, expected_type)
-                types.append(type_class)
-            except AttributeError:
-                logger.debug(f"Unrecognized type: {expected_type}")
-            if len(types) == 0:
-                raise ValueError("No recognized spark types in expected_types_list")  # noqa: TRY003
-            types = tuple(types)
-            success = isinstance(actual_column_type, types)
+        # Only DataType subclasses name a Spark type; pyspark.types also exports helpers,
+        # typing aliases and imported modules that must not be treated as types.
+        type_class = getattr(pyspark.types, expected_type, None)
+        is_data_type = isinstance(type_class, type) and issubclass(
+            type_class, pyspark.types.DataType
+        )
+        if not is_data_type:
+            msg = f"Unrecognized spark type: {expected_type}"
+            raise ValueError(msg)
         return {
-            "success": success,
+            "success": isinstance(actual_column_type, type_class),
             "result": {"observed_value": type(actual_column_type).__name__},
         }
 
@@ -435,7 +387,8 @@ class ExpectColumnTypeToBe(BatchExpectation):
             if type_dict["name"] == column_name
         ]
         if not matches:
-            return {"success": False, "result": {"observed_value": None}}
+            msg = f'Error: The column "{column_name}" in BatchData does not exist.'
+            raise InvalidMetricAccessorDomainKwargsKeyError(msg)
 
         actual_column_type = matches[0]
 

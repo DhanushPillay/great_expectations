@@ -3,10 +3,27 @@ import pandas as pd
 import pytest
 
 import great_expectations.expectations as gxe
+from great_expectations.exceptions import InvalidMetricAccessorDomainKwargsKeyError
 from great_expectations.expectations.core.expect_column_type_to_be import (
     ExpectColumnTypeToBe,
 )
 from great_expectations.self_check.util import build_sa_validator_with_data
+
+
+def _supports_nan_backed_string_dtype() -> bool:
+    # StringDtype(na_value=...) -- the dtype pandas 3 uses for string columns -- exists from
+    # pandas 2.3.
+    try:
+        pd.StringDtype(na_value=np.nan)
+    except TypeError:
+        return False
+    return True
+
+
+requires_nan_backed_string_dtype = pytest.mark.skipif(
+    not _supports_nan_backed_string_dtype(),
+    reason="StringDtype(na_value=...) requires pandas>=2.3",
+)
 
 
 @pytest.mark.unit
@@ -115,7 +132,6 @@ def test_validate_pandas_nullable_and_numpy_dtypes_are_distinct(column_dtype, ex
         pytest.param(pd.Float64Dtype(), "Float64", id="Float64"),
         pytest.param(np.dtype("float64"), "float", id="float-alias"),
         pytest.param(np.dtype("object"), "O", id="O-alias"),
-        pytest.param(np.dtype("object"), "object_", id="object_-alias"),
         pytest.param(pd.CategoricalDtype(["x", "y"]), "category", id="category"),
         pytest.param(
             pd.DatetimeTZDtype(unit="ns", tz="UTC"), "datetime64[ns, UTC]", id="tz-datetime"
@@ -136,6 +152,7 @@ def test_validate_pandas_matches_exact_dtype(column_dtype, expected_type):
 
 
 @pytest.mark.unit
+@requires_nan_backed_string_dtype
 def test_validate_pandas_nan_backed_string_column_does_not_match_string():
     """Every StringDtype compares equal to "string"; only the pd.NA-backed one is that dtype."""
     column_dtype = pd.StringDtype(na_value=np.nan)
@@ -143,6 +160,48 @@ def test_validate_pandas_nan_backed_string_column_does_not_match_string():
     result = expectation._validate_pandas(actual_column_type=column_dtype, expected_type="string")
     assert result["success"] is False
     assert result["result"] == {"observed_value": "str"}
+
+
+@pytest.mark.unit
+@requires_nan_backed_string_dtype
+def test_validate_pandas_nan_backed_string_column_matches_str():
+    """The pandas 3 default string column is "str"; "string" is the pd.NA-backed dtype."""
+    expectation = ExpectColumnTypeToBe(column="a", type_="str")
+    result = expectation._validate_pandas(
+        actual_column_type=pd.StringDtype(na_value=np.nan), expected_type="str"
+    )
+    assert result["success"] is True
+    assert result["result"] == {"observed_value": "str"}
+
+
+@pytest.mark.unit
+def test_validate_pandas_lower_case_time_zone_matches():
+    """pandas normalizes the time zone name, so the request is compared as a parsed dtype."""
+    expectation = ExpectColumnTypeToBe(column="a", type_="datetime64[ns, utc]")
+    result = expectation._validate_pandas(
+        actual_column_type=pd.DatetimeTZDtype(unit="ns", tz="UTC"),
+        expected_type="datetime64[ns, utc]",
+    )
+    assert result["success"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "column_dtype,expected_type",
+    [
+        pytest.param(np.dtype("int32"), "int64", id="int32-vs-int64"),
+        pytest.param(np.dtype("int8"), "int64", id="int8-vs-int64"),
+        pytest.param(np.dtype("uint64"), "int64", id="uint64-vs-int64"),
+        pytest.param(np.dtype("float32"), "float64", id="float32-vs-float64"),
+        pytest.param(pd.Int32Dtype(), "Int64", id="Int32-vs-Int64"),
+    ],
+)
+def test_validate_pandas_numeric_width_and_signedness_must_match(column_dtype, expected_type):
+    expectation = ExpectColumnTypeToBe(column="a", type_=expected_type)
+    result = expectation._validate_pandas(
+        actual_column_type=column_dtype, expected_type=expected_type
+    )
+    assert result["success"] is False
 
 
 @pytest.mark.unit
@@ -182,10 +241,56 @@ def test_validate_pandas_unknown_type_raises():
 
 
 @pytest.mark.unit
-def test_validate_missing_column_fails_with_null_observed_value():
+def test_validate_missing_column_raises():
     expectation = ExpectColumnTypeToBe(column="missing", type_="INTEGER")
-    result = expectation._validate(metrics={"table.column_types": []})
-    assert result == {"success": False, "result": {"observed_value": None}}
+    with pytest.raises(
+        InvalidMetricAccessorDomainKwargsKeyError,
+        match='The column "missing" in BatchData does not exist',
+    ):
+        expectation._validate(
+            metrics={"table.column_types": [{"name": "present", "type": np.dtype("int64")}]}
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "include_column_name,expected_template",
+    [
+        pytest.param(True, "$column must be of type $type_.", id="with-column"),
+        pytest.param(False, "must be of type $type_.", id="without-column"),
+    ],
+)
+def test_prescriptive_renderer_respects_include_column_name(include_column_name, expected_template):
+    configuration = ExpectColumnTypeToBe(column="a", type_="int64").configuration
+    rendered = ExpectColumnTypeToBe._prescriptive_renderer(
+        configuration=configuration,
+        runtime_configuration={"include_column_name": include_column_name},
+    )
+    assert rendered[0].string_template["template"] == expected_template
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "compared,observed,expected_type,expected_success",
+    [
+        pytest.param(False, "BIGINT", "BIGINT", True, id="observed-name-matches"),
+        pytest.param(False, "BIGINT", "bigint", True, id="observed-name-any-case"),
+        pytest.param(False, "INTEGER", "int4", False, id="alias-is-not-resolved"),
+        pytest.param(True, "INTEGER", "Integer", True, id="comparison-match-kept"),
+    ],
+)
+def test_validate_sqlalchemy_matches_the_observed_type_name(
+    mocker, compared, observed, expected_type, expected_success
+):
+    mocker.patch(
+        "great_expectations.expectations.core.expect_column_type_to_be.compare_column_type",
+        return_value=(compared, observed),
+    )
+    expectation = ExpectColumnTypeToBe(column="a", type_=expected_type)
+    result = expectation._validate_sqlalchemy(
+        actual_column_type=object(), expected_type=expected_type, execution_engine=object()
+    )
+    assert result == {"success": expected_success, "result": {"observed_value": observed}}
 
 
 @pytest.mark.unit
@@ -236,7 +341,8 @@ def test_sqlite_end_to_end_success_and_failure(sa):
 
 
 @pytest.mark.sqlite
-def test_sqlite_unknown_type_reports_exception(sa):
+def test_sqlite_unknown_type_is_a_plain_failure(sa):
+    """SQL dialects expose no reliable type list, so an unknown name is a mismatch, not an error."""
     df = pd.DataFrame({"col": ["test_val1", "test_val2"]})
     validator = build_sa_validator_with_data(
         df=df,
@@ -244,5 +350,7 @@ def test_sqlite_unknown_type_reports_exception(sa):
         table_name="expect_column_type_to_be_sqlite_unknown",
     )
 
-    with pytest.raises(ValueError, match="Unrecognized sqlalchemy type"):
-        validator.expect_column_type_to_be("col", type_="NUMBER")
+    result = validator.expect_column_type_to_be("col", type_="NUMBER")
+    assert result.success is False
+    assert result.exception_info["raised_exception"] is False
+    assert result.result["observed_value"] == "TEXT"
