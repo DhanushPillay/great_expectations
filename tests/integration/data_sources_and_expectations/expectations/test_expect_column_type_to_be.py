@@ -276,6 +276,8 @@ def test_spark_known_type(batch_for_datasource: Batch, type_: str, expected_succ
         pytest.param("int", id="spark-sql-name"),
         pytest.param("Row", id="non-type-class"),
         pytest.param("Any", id="typing-alias"),
+        pytest.param("datetime", id="imported-module"),
+        pytest.param("cast", id="imported-function"),
     ],
 )
 @parameterize_batch_for_data_sources(
@@ -403,6 +405,24 @@ def test_unresolved_type_name_is_a_plain_failure_postgresql(
     type to use instead."""
     result = batch_for_datasource.validate(
         gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_=type_)
+    )
+    assert not result.success
+    assert result.exception_info["raised_exception"] is False
+    assert result.result == {"observed_value": "INTEGER"}
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        MySQLDatasourceTestConfig(),
+        PostgreSQLDatasourceTestConfig(),
+        SqliteDatasourceTestConfig(),
+    ],
+    data=DATA,
+)
+def test_observed_type_name_must_match_exactly(batch_for_datasource: Batch) -> None:
+    """A name that is only a prefix of the observed type name does not match it."""
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN, type_="INT")
     )
     assert not result.success
     assert result.exception_info["raised_exception"] is False

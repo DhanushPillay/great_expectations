@@ -205,6 +205,41 @@ def test_validate_pandas_numeric_width_and_signedness_must_match(column_dtype, e
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "storage,expected_type",
+    [
+        pytest.param("python", "string[pyarrow]", id="python-column-pyarrow-request"),
+        pytest.param("pyarrow", "string[python]", id="pyarrow-column-python-request"),
+    ],
+)
+def test_validate_pandas_string_storage_is_not_compared(storage, expected_type):
+    pytest.importorskip("pyarrow")
+    expectation = ExpectColumnTypeToBe(column="a", type_=expected_type)
+    result = expectation._validate_pandas(
+        actual_column_type=pd.StringDtype(storage), expected_type=expected_type
+    )
+    assert result["success"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ImportError("pyarrow is required"), id="import-error"),
+        pytest.param(NotImplementedError("unsupported parameters"), id="not-implemented"),
+    ],
+)
+def test_validate_pandas_any_parser_error_is_an_unrecognized_type(mocker, error):
+    mocker.patch("pandas.api.types.pandas_dtype", side_effect=error)
+    expectation = ExpectColumnTypeToBe(column="a", type_="int64[pyarrow]")
+    with pytest.raises(ValueError, match=r"Unrecognized pandas type: int64\[pyarrow\]") as exc:
+        expectation._validate_pandas(
+            actual_column_type=np.dtype("int64"), expected_type="int64[pyarrow]"
+        )
+    assert exc.value.__cause__ is error
+
+
+@pytest.mark.unit
 def test_validate_pandas_observed_value_names_the_nullable_dtype():
     expectation = ExpectColumnTypeToBe(column="a", type_="int64")
     result = expectation._validate_pandas(actual_column_type=pd.Int64Dtype(), expected_type="int64")
@@ -253,18 +288,35 @@ def test_validate_missing_column_raises():
 
 
 @pytest.mark.unit
+def test_validate_column_name_match_is_exact():
+    expectation = ExpectColumnTypeToBe(column="present", type_="int64")
+    with pytest.raises(InvalidMetricAccessorDomainKwargsKeyError, match='"present"'):
+        expectation._validate(
+            metrics={"table.column_types": [{"name": "Present", "type": np.dtype("int64")}]}
+        )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
-    "include_column_name,expected_template",
+    "runtime_configuration,expected_template",
     [
-        pytest.param(True, "$column must be of type $type_.", id="with-column"),
-        pytest.param(False, "must be of type $type_.", id="without-column"),
+        pytest.param(
+            {"include_column_name": True}, "$column must be of type $type_.", id="with-column"
+        ),
+        pytest.param(
+            {"include_column_name": False}, "must be of type $type_.", id="without-column"
+        ),
+        pytest.param({}, "$column must be of type $type_.", id="default"),
+        pytest.param(None, "$column must be of type $type_.", id="no-runtime-configuration"),
     ],
 )
-def test_prescriptive_renderer_respects_include_column_name(include_column_name, expected_template):
+def test_prescriptive_renderer_respects_include_column_name(
+    runtime_configuration, expected_template
+):
     configuration = ExpectColumnTypeToBe(column="a", type_="int64").configuration
     rendered = ExpectColumnTypeToBe._prescriptive_renderer(
         configuration=configuration,
-        runtime_configuration={"include_column_name": include_column_name},
+        runtime_configuration=runtime_configuration,
     )
     assert rendered[0].string_template["template"] == expected_template
 
@@ -276,7 +328,10 @@ def test_prescriptive_renderer_respects_include_column_name(include_column_name,
         pytest.param(False, "BIGINT", "BIGINT", True, id="observed-name-matches"),
         pytest.param(False, "BIGINT", "bigint", True, id="observed-name-any-case"),
         pytest.param(False, "INTEGER", "int4", False, id="alias-is-not-resolved"),
-        pytest.param(True, "INTEGER", "Integer", True, id="comparison-match-kept"),
+        pytest.param(False, "INTEGER", "INT", False, id="prefix-is-not-a-match"),
+        pytest.param(False, "VARCHAR(20)", "VARCHAR(10)", False, id="parameters-must-match"),
+        pytest.param(False, "VARCHAR(20)", "VARCHAR", False, id="parameters-are-not-ignored"),
+        pytest.param(True, "TEXT", "String", True, id="comparison-match-kept"),
     ],
 )
 def test_validate_sqlalchemy_matches_the_observed_type_name(
