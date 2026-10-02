@@ -43,6 +43,20 @@ TYPED_DATA = pd.DataFrame(
     }
 )
 
+NULLABLE_INTEGER_COLUMN = "nullable_integers"
+DATETIME_COLUMN = "datetimes"
+
+NULLABLE_DATA = pd.DataFrame(
+    {
+        INTEGER_COLUMN: pd.Series([1, 2, 3], dtype="int64"),
+        NULLABLE_INTEGER_COLUMN: pd.Series([1, None, 3], dtype="Int64"),
+    }
+)
+
+DATETIME_DATA = pd.DataFrame(
+    {DATETIME_COLUMN: pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"])}
+)
+
 
 try:
     from great_expectations.compatibility.pyspark import types as PYSPARK_TYPES
@@ -92,6 +106,44 @@ def test_success_object_dtype(batch_for_datasource: Batch) -> None:
     assert result.success
 
 
+@pytest.mark.parametrize(
+    "column,type_,expected_success,expected_observed",
+    [
+        pytest.param(NULLABLE_INTEGER_COLUMN, "Int64", True, "Int64", id="Int64-matches-Int64"),
+        pytest.param(NULLABLE_INTEGER_COLUMN, "int64", False, "Int64", id="Int64-not-int64"),
+        pytest.param(INTEGER_COLUMN, "Int64", False, "int64", id="int64-not-Int64"),
+    ],
+)
+@parameterize_batch_for_data_sources(
+    data_source_configs=JUST_PANDAS_DATA_SOURCES,
+    data=NULLABLE_DATA,
+)
+def test_nullable_and_numpy_integer_dtypes_are_distinct(
+    batch_for_datasource: Batch,
+    column: str,
+    type_: str,
+    expected_success: bool,
+    expected_observed: str,
+) -> None:
+    result = batch_for_datasource.validate(gxe.ExpectColumnTypeToBe(column=column, type_=type_))
+    assert result.success is expected_success
+    assert result.result["observed_value"] == expected_observed
+    assert result.exception_info["raised_exception"] is False
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=JUST_PANDAS_DATA_SOURCES,
+    data=DATETIME_DATA,
+)
+def test_unitless_datetime64_matches_any_resolution(batch_for_datasource: Batch) -> None:
+    """The default datetime resolution differs across pandas versions; a unit-less name matches."""
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=DATETIME_COLUMN, type_="datetime64")
+    )
+    assert result.success
+    assert result.result["observed_value"].startswith("datetime64[")
+
+
 @parameterize_batch_for_data_sources(
     data_source_configs=JUST_PANDAS_DATA_SOURCES,
     data=DATA,
@@ -100,7 +152,7 @@ def test_str_does_not_match_object_dtype(batch_for_datasource: Batch) -> None:
     expectation = gxe.ExpectColumnTypeToBe(column=STRING_COLUMN, type_="str")
     result = batch_for_datasource.validate(expectation)
     assert not result.success
-    assert result.result["observed_value"] == "object_"
+    assert result.result["observed_value"] == "object"
 
 
 @parameterize_batch_for_data_sources(
