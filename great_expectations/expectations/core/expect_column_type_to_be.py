@@ -10,7 +10,6 @@ from great_expectations.compatibility.typing_extensions import override
 from great_expectations.core.suite_parameters import (
     SuiteParameterDict,  # noqa: TC001
 )
-from great_expectations.exceptions import InvalidMetricAccessorDomainKwargsKeyError
 from great_expectations.expectations.expectation import (
     BatchExpectation,
     render_suite_parameter_string,
@@ -20,7 +19,10 @@ from great_expectations.expectations.model_field_descriptions import (
     COLUMN_DESCRIPTION,
     FAILURE_SEVERITY_DESCRIPTION,
 )
-from great_expectations.expectations.type_comparison import compare_column_type
+from great_expectations.expectations.type_comparison import (
+    CASE_INSENSITIVE_DIALECTS,
+    compare_column_type,
+)
 from great_expectations.render import LegacyRendererType, RenderedStringTemplateContent
 from great_expectations.render.renderer.renderer import renderer
 from great_expectations.render.renderer_configuration import (
@@ -81,15 +83,17 @@ class ExpectColumnTypeToBe(BatchExpectation):
             This is a schema-level check against the column's exact dtype: 'int64' and 'Int64' \
             are different types, as are 'int64' and 'int32', and 'str' and 'string'; a datetime \
             unit or time zone, when given, must match; and an object-dtype column matches only \
-            an object type request ('object' or 'O'). The storage of a string dtype is not \
-            checked: 'string[python]' and 'string[pyarrow]' match the same columns. \
+            an object type request ('object' or 'O'). The storage of a string dtype \
+            ('python' or 'pyarrow') is not checked. \
             'category' matches any categorical column, 'interval' any interval column, and \
             'datetime64' or 'timedelta64' any time-zone-naive numpy column of that kind; other \
             names match only the exact dtype they name. \
             For a SqlAlchemy Datasource, type_ matches when it is the type name reported as the \
-            observed value, compared case-insensitively, or a SQLAlchemy type the column is an \
-            instance of, such as 'INTEGER' in most SQL dialects and 'TEXT' in dialects such as \
-            postgresql. Dialect aliases are not resolved: use the observed type name, for \
+            observed value, compared case-insensitively, such as 'INTEGER' in most SQL dialects \
+            and 'TEXT' in dialects such as postgresql. On dialects other than postgresql, \
+            snowflake, SQL Server, databricks and trino, type_ may also name a type class \
+            exported by the dialect's SQLAlchemy module, which matches every column that is an \
+            instance of it. Dialect aliases are not resolved: use the observed type name, for \
             example 'INTEGER' rather than 'int4' on postgresql. \
             Valid types for Spark Datasources are pyspark DataType class names such as \
             'StringType' and 'BooleanType'; an abstract class such as 'NumericType' matches every \
@@ -138,7 +142,7 @@ class ExpectColumnTypeToBe(BatchExpectation):
         {DATA_QUALITY_ISSUES[0]}
 
     Example Data:
-            A SQL table created as (test FLOAT, test2 INTEGER):
+            A SQLite table created as (test FLOAT, test2 INTEGER):
 
                 test 	test2
             0 	1.00 	2
@@ -280,8 +284,10 @@ class ExpectColumnTypeToBe(BatchExpectation):
         include_column_name = runtime_configuration.get("include_column_name") is not False
         styling = runtime_configuration.get("styling")
 
+        kwargs = configuration.kwargs if configuration is not None else {}
+
         params = substitute_none_for_missing(
-            configuration.kwargs,  # type: ignore[union-attr]
+            kwargs,
             ["column", "type_"],
         )
 
@@ -309,7 +315,7 @@ class ExpectColumnTypeToBe(BatchExpectation):
             # pandas_dtype is the parser for the requested name; whatever it raises (a
             # TypeError, or an ImportError for a pyarrow dtype without pyarrow installed)
             # means pandas cannot construct the requested type.
-            msg = f"Unrecognized pandas type: {expected_type}"
+            msg = f"Unrecognized pandas type: {expected_type} ({e})"
             raise ValueError(msg) from e
 
         if (
@@ -344,10 +350,12 @@ class ExpectColumnTypeToBe(BatchExpectation):
         success, observed_value = compare_column_type(
             execution_engine, actual_column_type, expected_type
         )
-        if not success:
-            # The observed value is the type name reported for the column, so naming it always
-            # matches -- including where the dialect module does not export that name, or
-            # resolves it to a dialect-specific class the reflected type is not an instance of.
+        if not success and execution_engine.dialect_name not in CASE_INSENSITIVE_DIALECTS:
+            # Where types are compared by SQLAlchemy class, the observed value is the class
+            # name, so naming it must match too -- including where the dialect module does not
+            # export that name, or resolves it to a dialect-specific class the reflected type is
+            # not an instance of. Case-insensitive dialects already compare type_ against the
+            # observed type name.
             success = str(observed_value).casefold() == expected_type.casefold()
         return {"success": success, "result": {"observed_value": observed_value}}
 
@@ -377,20 +385,30 @@ class ExpectColumnTypeToBe(BatchExpectation):
             SparkDFExecutionEngine,
             SqlAlchemyExecutionEngine,
         )
+        from great_expectations.expectations.metrics.util import (
+            get_dbms_compatible_column_names,
+        )
 
         column_name = self._get_success_kwarg("column")
         expected_type = self._get_success_kwarg("type_")
         actual_column_types_list = metrics.get("table.column_types", [])
-        matches = [
-            type_dict["type"]
-            for type_dict in actual_column_types_list
-            if type_dict["name"] == column_name
+        batch_column_names = [type_dict["name"] for type_dict in actual_column_types_list]
+        # Resolve the column the way other column expectations do: case-insensitively unless
+        # quoted, and accepting Spark's unescaped dotted names. Raises if it does not exist.
+        resolved_name = get_dbms_compatible_column_names(
+            column_names=column_name, batch_columns_list=batch_column_names
+        )
+        if resolved_name not in batch_column_names:
+            # An explicitly quoted name resolves to the name as the user wrote it; find the
+            # column it was matched against, unquoting it the same way.
+            quoted = str(resolved_name).casefold()
+            unquoted = {quoted.strip('"'), quoted.strip("[]"), quoted.strip("`")}
+            resolved_name = next(
+                name for name in batch_column_names if str(name).casefold() in unquoted
+            )
+        actual_column_type = actual_column_types_list[batch_column_names.index(resolved_name)][
+            "type"
         ]
-        if not matches:
-            msg = f'Error: The column "{column_name}" in BatchData does not exist.'
-            raise InvalidMetricAccessorDomainKwargsKeyError(msg)
-
-        actual_column_type = matches[0]
 
         if isinstance(execution_engine, SqlAlchemyExecutionEngine):
             return self._validate_sqlalchemy(

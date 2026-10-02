@@ -7,6 +7,10 @@ from sqlalchemy import types as sqlatypes
 import great_expectations.expectations as gxe
 from great_expectations.core.result_format import ResultFormat
 from great_expectations.datasource.fluent.interfaces import Batch
+from great_expectations.execution_engine import (
+    SparkDFExecutionEngine,
+    SqlAlchemyExecutionEngine,
+)
 from tests.integration.conftest import parameterize_batch_for_data_sources
 from tests.integration.data_sources_and_expectations.data_source_lists import (
     JUST_PANDAS_DATA_SOURCES,
@@ -63,6 +67,7 @@ DATETIME_DATA = pd.DataFrame(
 BIGINT_COLUMN = "bigints"
 DATE_COLUMN = "dates"
 SQL_DATETIME_COLUMN = "sql_datetimes"
+JSON_COLUMN = "json_values"
 
 SQL_TYPED_DATA = pd.DataFrame(
     {
@@ -73,6 +78,8 @@ SQL_TYPED_DATA = pd.DataFrame(
         ),
     }
 )
+
+JSON_DATA = pd.DataFrame({JSON_COLUMN: [1, 2]})
 
 PANDAS_3 = int(pd.__version__.split(".")[0]) >= 3
 
@@ -342,7 +349,7 @@ def test_case_insensitive_dialects(batch_for_datasource: Batch) -> None:
     data=DATA,
 )
 def test_double_precision_matches_float_not_int(batch_for_datasource: Batch) -> None:
-    """Multi-word DDL type is known vocabulary: match on float, plain mismatch on int."""
+    """A multi-word type name matches the float column and is a plain mismatch on int."""
     float_result = batch_for_datasource.validate(
         gxe.ExpectColumnTypeToBe(column=FLOAT_COLUMN, type_="DOUBLE PRECISION")
     )
@@ -427,6 +434,49 @@ def test_observed_type_name_must_match_exactly(batch_for_datasource: Batch) -> N
     assert not result.success
     assert result.exception_info["raised_exception"] is False
     assert result.result == {"observed_value": "INTEGER"}
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        MySQLDatasourceTestConfig(column_types={JSON_COLUMN: sqlatypes.JSON}),
+        SqliteDatasourceTestConfig(column_types={JSON_COLUMN: sqlatypes.JSON}),
+    ],
+    data=JSON_DATA,
+)
+def test_lower_case_json_matches_json_column(batch_for_datasource: Batch) -> None:
+    """The dialect modules export a `json` submodule, which must not be taken for the type."""
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=JSON_COLUMN, type_="json")
+    )
+    assert result.success
+    assert result.result == {"observed_value": "JSON"}
+
+
+@parameterize_batch_for_data_sources(
+    data_source_configs=[
+        PandasDataFrameDatasourceTestConfig(),
+        SqliteDatasourceTestConfig(),
+        MySQLDatasourceTestConfig(),
+        PostgreSQLDatasourceTestConfig(),
+        SparkFilesystemCsvDatasourceTestConfig(column_types=SPARK_COLUMN_TYPES),
+    ],
+    data=DATA,
+)
+def test_column_name_is_resolved_case_insensitively(batch_for_datasource: Batch) -> None:
+    """A column is found under a differently-cased name, as for other column expectations."""
+    execution_engine = batch_for_datasource.data.execution_engine
+    if isinstance(execution_engine, SqlAlchemyExecutionEngine):
+        type_ = "INTEGER"
+    elif isinstance(execution_engine, SparkDFExecutionEngine):
+        type_ = "IntegerType"
+    else:
+        type_ = "object"
+
+    result = batch_for_datasource.validate(
+        gxe.ExpectColumnTypeToBe(column=INTEGER_COLUMN.upper(), type_=type_)
+    )
+    assert result.success
+    assert result.exception_info["raised_exception"] is False
 
 
 @parameterize_batch_for_data_sources(

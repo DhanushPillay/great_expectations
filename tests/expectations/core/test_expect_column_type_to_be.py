@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -288,12 +290,25 @@ def test_validate_missing_column_raises():
 
 
 @pytest.mark.unit
-def test_validate_column_name_match_is_exact():
-    expectation = ExpectColumnTypeToBe(column="present", type_="int64")
-    with pytest.raises(InvalidMetricAccessorDomainKwargsKeyError, match='"present"'):
-        expectation._validate(
-            metrics={"table.column_types": [{"name": "Present", "type": np.dtype("int64")}]}
-        )
+@pytest.mark.parametrize(
+    "batch_column_name,column",
+    [
+        pytest.param("Present", "present", id="differently-cased"),
+        pytest.param("present", '"present"', id="quoted"),
+        pytest.param("`a.b`", "a.b", id="spark-dotted-name"),
+    ],
+)
+def test_validate_resolves_column_name_like_other_column_expectations(batch_column_name, column):
+    expectation = ExpectColumnTypeToBe(column=column, type_="int64")
+    result = expectation._validate(
+        metrics={
+            "table.column_types": [
+                {"name": "other", "type": np.dtype("float64")},
+                {"name": batch_column_name, "type": np.dtype("int64")},
+            ]
+        }
+    )
+    assert result == {"success": True, "result": {"observed_value": "int64"}}
 
 
 @pytest.mark.unit
@@ -322,20 +337,39 @@ def test_prescriptive_renderer_respects_include_column_name(
 
 
 @pytest.mark.unit
+def test_prescriptive_renderer_without_configuration():
+    rendered = ExpectColumnTypeToBe._prescriptive_renderer(configuration=None)
+    assert rendered[0].string_template["template"] == "$column must be of type $type_."
+    assert rendered[0].string_template["params"] == {"column": None, "type_": None}
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
-    "compared,observed,expected_type,expected_success",
+    "dialect_name,compared,observed,expected_type,expected_success",
     [
-        pytest.param(False, "BIGINT", "BIGINT", True, id="observed-name-matches"),
-        pytest.param(False, "BIGINT", "bigint", True, id="observed-name-any-case"),
-        pytest.param(False, "INTEGER", "int4", False, id="alias-is-not-resolved"),
-        pytest.param(False, "INTEGER", "INT", False, id="prefix-is-not-a-match"),
-        pytest.param(False, "VARCHAR(20)", "VARCHAR(10)", False, id="parameters-must-match"),
-        pytest.param(False, "VARCHAR(20)", "VARCHAR", False, id="parameters-are-not-ignored"),
-        pytest.param(True, "TEXT", "String", True, id="comparison-match-kept"),
+        pytest.param("sqlite", False, "BIGINT", "BIGINT", True, id="observed-name-matches"),
+        pytest.param("sqlite", False, "BIGINT", "bigint", True, id="observed-name-any-case"),
+        pytest.param("mysql", False, "INTEGER", "int4", False, id="alias-is-not-resolved"),
+        pytest.param("mysql", False, "INTEGER", "INT", False, id="prefix-is-not-a-match"),
+        pytest.param(
+            "sqlite", False, "VARCHAR(20)", "VARCHAR(10)", False, id="parameters-must-match"
+        ),
+        pytest.param(
+            "sqlite", False, "VARCHAR(20)", "VARCHAR", False, id="parameters-are-not-ignored"
+        ),
+        pytest.param("sqlite", True, "TEXT", "String", True, id="comparison-match-kept"),
+        pytest.param(
+            "postgresql",
+            False,
+            "BIGINT",
+            "bigint",
+            False,
+            id="case-insensitive-dialect-keeps-its-own-comparison",
+        ),
     ],
 )
 def test_validate_sqlalchemy_matches_the_observed_type_name(
-    mocker, compared, observed, expected_type, expected_success
+    mocker, dialect_name, compared, observed, expected_type, expected_success
 ):
     mocker.patch(
         "great_expectations.expectations.core.expect_column_type_to_be.compare_column_type",
@@ -343,7 +377,9 @@ def test_validate_sqlalchemy_matches_the_observed_type_name(
     )
     expectation = ExpectColumnTypeToBe(column="a", type_=expected_type)
     result = expectation._validate_sqlalchemy(
-        actual_column_type=object(), expected_type=expected_type, execution_engine=object()
+        actual_column_type=object(),
+        expected_type=expected_type,
+        execution_engine=SimpleNamespace(dialect_name=dialect_name),
     )
     assert result == {"success": expected_success, "result": {"observed_value": observed}}
 
