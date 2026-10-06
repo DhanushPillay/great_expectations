@@ -641,6 +641,23 @@ def test_quote_spark_identifier():
     assert _quote_spark_identifier("`") == "````"
 
 
+@pytest.mark.parametrize(
+    "identifier,expected",
+    [
+        pytest.param("address.city", "`address`.`city`", id="nested_struct_path"),
+        pytest.param("Data.evt.retry", "`Data`.`evt`.`retry`", id="deeply_nested_path"),
+        pytest.param("home address.zip-code", "`home address`.`zip-code`", id="nested_odd_chars"),
+        pytest.param("parent.`child.x`", "`parent`.`child.x`", id="backticked_leaf"),
+        pytest.param("`a``b`.c", "`a``b`.`c`", id="escaped_backtick_segment"),
+        pytest.param("a.", "`a.`", id="trailing_dot_quoted_whole"),
+        pytest.param("a..b", "`a..b`", id="empty_segment_quoted_whole"),
+        pytest.param("`a`b", "```a``b`", id="malformed_backtick_quoted_whole"),
+    ],
+)
+def test_quote_spark_identifier_quotes_each_path_segment(identifier, expected):
+    assert _quote_spark_identifier(identifier) == expected
+
+
 # Function to test for spark dataframe equality
 def dataframes_equal(first_table, second_table):
     if first_table.schema != second_table.schema:
